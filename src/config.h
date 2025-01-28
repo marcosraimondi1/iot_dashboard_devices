@@ -21,4 +21,14 @@
 
 #define MQTT_CLIENTID		"frdm_k64f_zephyr"
 
+#define MAX_RECV_BUF_LEN 1024
+
+#define HTTP_PORT 3001
+
+#define SERVER_ENDPOINT "/api/getdevicecredentials"
+
+#define HEADERS "Content-type: application/x-www-form-urlencoded\r\n"
+
+#define REQ_PAYLOAD "dId=1&password=pass"
+
 #endif
