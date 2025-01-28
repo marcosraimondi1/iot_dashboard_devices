@@ -4,38 +4,57 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "unistd.h"
-#include <stdint.h>
-#include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(net_mqtt_publisher_sample, LOG_LEVEL_DBG);
+#include "config.h"
 
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/net/mqtt.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/random/random.h>
 
-#include <errno.h>
-#include <string.h>
-
-#include "config.h"
-
-#define APP_BMEM
-#define APP_DMEM
+#define RC_STR(rc) ((rc) == 0 ? "OK" : "ERROR")
+#define PRINT_RESULT(func, rc) printf("%s: %d <%s>\n", (func), rc, RC_STR(rc))
+#define SUCCESS_OR_EXIT(rc)                                                    \
+  {                                                                            \
+    if (rc != 0) {                                                             \
+      return 1;                                                                \
+    }                                                                          \
+  }
+#define SUCCESS_OR_BREAK(rc)                                                   \
+  {                                                                            \
+    if (rc != 0) {                                                             \
+      break;                                                                   \
+    }                                                                          \
+  }
 
 /* Buffers for MQTT client. */
-static APP_BMEM uint8_t rx_buffer[APP_MQTT_BUFFER_SIZE];
-static APP_BMEM uint8_t tx_buffer[APP_MQTT_BUFFER_SIZE];
+static uint8_t rx_buffer[APP_MQTT_BUFFER_SIZE];
+static uint8_t tx_buffer[APP_MQTT_BUFFER_SIZE];
 
 /* The mqtt client struct */
-static APP_BMEM struct mqtt_client client_ctx;
+static struct mqtt_client client_ctx;
+static struct mqtt_utf8 username = {.utf8 = (uint8_t *)MQTT_USERNAME,
+                                    .size = sizeof(MQTT_USERNAME) - 1};
+static struct mqtt_utf8 password = {.utf8 = (uint8_t *)MQTT_PASSWORD,
+                                    .size = sizeof(MQTT_PASSWORD) - 1};
 
 /* MQTT Broker details. */
-static APP_BMEM struct sockaddr_storage broker;
+static struct sockaddr_storage broker;
 
-static APP_BMEM struct pollfd fds[1];
-static APP_BMEM int nfds;
+static struct pollfd fds[1];
+static int nfds;
 
-static APP_BMEM bool connected;
+static bool connected;
+
+/* GPIO */
+#define LED0_NODE DT_ALIAS(led0)
+static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 
 static void prepare_fds(struct mqtt_client *client) {
   if (client->transport.type == MQTT_TRANSPORT_NON_SECURE) {
@@ -54,11 +73,17 @@ static int wait(int timeout) {
   if (nfds > 0) {
     ret = poll(fds, nfds, timeout);
     if (ret < 0) {
-      LOG_ERR("poll error: %d", errno);
+      printf("poll error: %d\n", errno);
     }
   }
 
   return ret;
+}
+
+void process_message(struct mqtt_publish_message msg) {
+  static uint8_t data[APP_MQTT_BUFFER_SIZE];
+  mqtt_read_publish_payload(&client_ctx, data, msg.payload.len);
+  printf("Received: %s from %s\n", data, msg.topic.topic.utf8);
 }
 
 void mqtt_evt_handler(struct mqtt_client *const client,
@@ -66,19 +91,24 @@ void mqtt_evt_handler(struct mqtt_client *const client,
   int err;
 
   switch (evt->type) {
+  case MQTT_EVT_PUBLISH:
+    process_message(evt->param.publish.message);
+
+    break;
+
   case MQTT_EVT_CONNACK:
     if (evt->result != 0) {
-      LOG_ERR("MQTT connect failed %d", evt->result);
+      printf("MQTT connect failed %d\n", evt->result);
       break;
     }
 
     connected = true;
-    LOG_INF("MQTT client connected!");
+    printf("MQTT client connected!\n");
 
     break;
 
   case MQTT_EVT_DISCONNECT:
-    LOG_INF("MQTT client disconnected %d", evt->result);
+    printf("MQTT client disconnected %d\n", evt->result);
 
     connected = false;
     clear_fds();
@@ -87,44 +117,37 @@ void mqtt_evt_handler(struct mqtt_client *const client,
 
   case MQTT_EVT_PUBACK:
     if (evt->result != 0) {
-      LOG_ERR("MQTT PUBACK error %d", evt->result);
+      printf("MQTT PUBACK error %d\n", evt->result);
       break;
     }
-
-    LOG_INF("PUBACK packet id: %u", evt->param.puback.message_id);
 
     break;
 
   case MQTT_EVT_PUBREC:
     if (evt->result != 0) {
-      LOG_ERR("MQTT PUBREC error %d", evt->result);
+      printf("MQTT PUBREC error %d\n", evt->result);
       break;
     }
-
-    LOG_INF("PUBREC packet id: %u", evt->param.pubrec.message_id);
 
     const struct mqtt_pubrel_param rel_param = {
         .message_id = evt->param.pubrec.message_id};
 
     err = mqtt_publish_qos2_release(client, &rel_param);
     if (err != 0) {
-      LOG_ERR("Failed to send MQTT PUBREL: %d", err);
+      printf("Failed to send MQTT PUBREL: %d\n", err);
     }
 
     break;
 
   case MQTT_EVT_PUBCOMP:
     if (evt->result != 0) {
-      LOG_ERR("MQTT PUBCOMP error %d", evt->result);
+      printf("MQTT PUBCOMP error %d\n", evt->result);
       break;
     }
-
-    LOG_INF("PUBCOMP packet id: %u", evt->param.pubcomp.message_id);
-
     break;
 
   case MQTT_EVT_PINGRESP:
-    LOG_INF("PINGRESP packet");
+    printf("PINGRESP packet\n");
     break;
 
   default:
@@ -132,34 +155,29 @@ void mqtt_evt_handler(struct mqtt_client *const client,
   }
 }
 
-static char *get_mqtt_payload(enum mqtt_qos qos) {
-  static APP_DMEM char payload[] = "{ \"value\": 1 }";
+static char *get_mqtt_payload() {
+  static char payload[] = "{ \"value\": 1 }";
   static int flag = 0;
+
   if (flag) {
+    gpio_pin_set_dt(&led, 0);
     payload[11] = '0';
   } else {
+    gpio_pin_set_dt(&led, 1);
     payload[11] = '1';
   }
 
   flag = (flag + 1) % 2;
 
-  sleep(1);
-
   return payload;
 }
 
-static char *get_mqtt_topic(void) {
-  return "679103d95d9261fdf4d81397/1/goRrYVqZw2/sdata";
-}
-
-static int publish(struct mqtt_client *client, enum mqtt_qos qos) {
+static int publish(struct mqtt_client *client, struct mqtt_topic topic,
+                   struct mqtt_binstr payload) {
   struct mqtt_publish_param param;
 
-  param.message.topic.qos = qos;
-  param.message.topic.topic.utf8 = (uint8_t *)get_mqtt_topic();
-  param.message.topic.topic.size = strlen(param.message.topic.topic.utf8);
-  param.message.payload.data = get_mqtt_payload(qos);
-  param.message.payload.len = strlen(param.message.payload.data);
+  param.message.topic = topic;
+  param.message.payload = payload;
   param.message_id = sys_rand16_get();
   param.dup_flag = 0U;
   param.retain_flag = 0U;
@@ -167,23 +185,14 @@ static int publish(struct mqtt_client *client, enum mqtt_qos qos) {
   return mqtt_publish(client, &param);
 }
 
-#define RC_STR(rc) ((rc) == 0 ? "OK" : "ERROR")
-
-#define PRINT_RESULT(func, rc) LOG_INF("%s: %d <%s>", (func), rc, RC_STR(rc))
-
 static void broker_init(void) {
   struct sockaddr_in *broker4 = (struct sockaddr_in *)&broker;
 
   broker4->sin_family = AF_INET;
   broker4->sin_port = htons(SERVER_PORT);
   inet_pton(AF_INET, SERVER_ADDR, &broker4->sin_addr);
-  LOG_INF("attempting to connect to server: %s\n", SERVER_ADDR);
+  printf("attempting to connect to server: %s\n", SERVER_ADDR);
 }
-
-static struct mqtt_utf8 username = {.utf8 = (uint8_t *)"user",
-                                    .size = sizeof("user") - 1};
-static struct mqtt_utf8 password = {.utf8 = (uint8_t *)"pass",
-                                    .size = sizeof("pass") - 1};
 
 static void client_init(struct mqtt_client *client) {
   mqtt_client_init(client);
@@ -273,89 +282,58 @@ static int process_mqtt_and_sleep(struct mqtt_client *client, int timeout) {
   return 0;
 }
 
-#define SUCCESS_OR_EXIT(rc)                                                    \
-  {                                                                            \
-    if (rc != 0) {                                                             \
-      return 1;                                                                \
-    }                                                                          \
-  }
-#define SUCCESS_OR_BREAK(rc)                                                   \
-  {                                                                            \
-    if (rc != 0) {                                                             \
-      break;                                                                   \
-    }                                                                          \
-  }
+static struct mqtt_subscription_list list;
+static struct mqtt_topic topics[1];
+const static int ntopics = 1;
 
-#define CONFIG_NET_SAMPLE_APP_MAX_ITERATIONS 10
-static int publisher(void) {
-  int i, rc, r = 0;
+void subscribe() {
+  topics[0].qos = MQTT_QOS_0_AT_MOST_ONCE;
+  topics[0].topic.utf8 = "679103d95d9261fdf4d81397/1/+/actdata";
+  topics[0].topic.size = strlen(topics[0].topic.utf8);
 
-  LOG_INF("attempting to connect: ");
-  rc = try_to_connect(&client_ctx);
-  PRINT_RESULT("try_to_connect", rc);
-  SUCCESS_OR_EXIT(rc);
+  list.list = topics;
+  list.list_count = ntopics;
+  list.message_id = sys_rand16_get();
 
-  i = 0;
-  while (i++ < CONFIG_NET_SAMPLE_APP_MAX_ITERATIONS && connected) {
-    r = -1;
-
-    rc = mqtt_ping(&client_ctx);
-    PRINT_RESULT("mqtt_ping", rc);
-    SUCCESS_OR_BREAK(rc);
-
-    rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
-    SUCCESS_OR_BREAK(rc);
-
-    rc = publish(&client_ctx, MQTT_QOS_0_AT_MOST_ONCE);
-    PRINT_RESULT("mqtt_publish", rc);
-    SUCCESS_OR_BREAK(rc);
-
-    rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
-    SUCCESS_OR_BREAK(rc);
-
-    rc = publish(&client_ctx, MQTT_QOS_1_AT_LEAST_ONCE);
-    PRINT_RESULT("mqtt_publish", rc);
-    SUCCESS_OR_BREAK(rc);
-
-    rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
-    SUCCESS_OR_BREAK(rc);
-
-    rc = publish(&client_ctx, MQTT_QOS_2_EXACTLY_ONCE);
-    PRINT_RESULT("mqtt_publish", rc);
-    SUCCESS_OR_BREAK(rc);
-
-    rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
-    SUCCESS_OR_BREAK(rc);
-
-    r = 0;
-  }
-
-  rc = mqtt_disconnect(&client_ctx);
-  PRINT_RESULT("mqtt_disconnect", rc);
-
-  LOG_INF("Bye!");
-
-  return r;
+  int r = mqtt_subscribe(&client_ctx, &list);
+  if (r < 0)
+    printf("mqtt_subscribe failed: %d", r);
+  process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
 }
 
-#define CONFIG_NET_SAMPLE_APP_MAX_CONNECTIONS 0
+void setup() {
+  // gpio
+  gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
+  gpio_pin_set_dt(&led, 0);
 
-static int start_app(void) {
-  int r = 0, i = 0;
-
-  while (!CONFIG_NET_SAMPLE_APP_MAX_CONNECTIONS ||
-         i++ < CONFIG_NET_SAMPLE_APP_MAX_CONNECTIONS) {
-    r = publisher();
-
-    if (!CONFIG_NET_SAMPLE_APP_MAX_CONNECTIONS) {
-      k_sleep(K_MSEC(5000));
-    }
+  // mqtt
+  while (!connected) {
+    printf("attempting to connect: \n");
+    try_to_connect(&client_ctx);
+    k_sleep(K_MSEC(APP_SLEEP_MSECS));
   }
 
-  return r;
+  k_sleep(K_MSEC(5000));
+  subscribe();
+}
+
+static struct mqtt_topic topic;
+static struct mqtt_binstr payload;
+
+void loop() {
+  topic.qos = MQTT_QOS_0_AT_MOST_ONCE;
+  topic.topic.utf8 = "679103d95d9261fdf4d81397/1/goRrYVqZw2/sdata";
+  topic.topic.size = strlen(topic.topic.utf8);
+  payload.data = get_mqtt_payload();
+  payload.len = strlen(payload.data);
+
+  publish(&client_ctx, topic, payload);
+  process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
 }
 
 int main(void) {
-  exit(start_app());
-  return 0;
+  setup();
+  while (1) {
+    loop();
+  }
 }
