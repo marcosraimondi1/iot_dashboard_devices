@@ -6,6 +6,25 @@ curl \
 
 # credentials change after certain delay, so you need to connect fast
 
+# response example
+{
+	"username":"fgqOt6H5sD",
+	"password":"8yt30cscDt",
+	"topic":"679103d95d9261fdf4d81397/1/",
+	"variables":[
+	{
+		"variable":"goRrYVqZw2",
+		"variableFullName":"LED Status",
+		"variableType":"input",
+		"variableSendFreq":30
+	},
+	{
+		"variable":"6YYrHcvKaK",
+		"variableFullName":"LED Control",
+		"variableType":"output"
+	}]
+}
+
 # with mosquitto clients
 # - subscribe
 mosquitto_sub --url mqtt://username:password@host:port/topic

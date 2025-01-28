@@ -17,6 +17,16 @@
 #include <zephyr/net/mqtt.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/random/random.h>
+#include <zephyr/net/http/client.h>
+#include <zephyr/data/json.h>
+
+#define HTTP_PORT 3001
+#define ENDPOINT "/api/getdevicecredentials"
+#define HEADERS "Content-type: application/x-www-form-urlencoded\r\n"
+#define REQ_PAYLOAD "dId=1&password=pass"
+#define MAX_RECV_BUF_LEN 1024
+static uint8_t http_recv_buf[MAX_RECV_BUF_LEN];
+
 
 #define RC_STR(rc) ((rc) == 0 ? "OK" : "ERROR")
 #define PRINT_RESULT(func, rc) printf("%s: %d <%s>\n", (func), rc, RC_STR(rc))
@@ -39,10 +49,8 @@ static uint8_t tx_buffer[APP_MQTT_BUFFER_SIZE];
 
 /* The mqtt client struct */
 static struct mqtt_client client_ctx;
-static struct mqtt_utf8 username = {.utf8 = (uint8_t *)MQTT_USERNAME,
-                                    .size = sizeof(MQTT_USERNAME) - 1};
-static struct mqtt_utf8 password = {.utf8 = (uint8_t *)MQTT_PASSWORD,
-                                    .size = sizeof(MQTT_PASSWORD) - 1};
+static struct mqtt_utf8 username;
+static struct mqtt_utf8 password;
 
 /* MQTT Broker details. */
 static struct sockaddr_storage broker;
@@ -56,6 +64,155 @@ static bool connected;
 #define LED0_NODE DT_ALIAS(led0)
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 
+// ---------------------------------------------
+
+static int setup_socket(const char *server, int port, int *sock,
+                        struct sockaddr *addr, socklen_t addr_len) {
+  int ret = 0;
+
+  memset(addr, 0, addr_len);
+
+  net_sin(addr)->sin_family = AF_INET;
+  net_sin(addr)->sin_port = htons(port);
+  inet_pton(AF_INET, server, &net_sin(addr)->sin_addr);
+  *sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+  if (*sock < 0) {
+    printf("Failed to create IPv4 HTTP socket (%d)", -errno);
+  }
+
+  return ret;
+}
+
+void parse_response(char *data, size_t len) {
+  static char user[100];
+  static char pass[100];
+  char topic[100];
+
+  // find username
+  char *start = strstr(data, "\"username\"");
+  if (start)
+  {
+    start+= strlen("\"username\":\"");
+    char *end=strchr(start, '\"');
+    if (end)
+    {
+      strncpy(user, start,end-start);
+      user[end - start] = '\0';
+      printf("\nUsername: %s\n", user);
+    }
+  }
+
+  // find password
+  start = strstr(data, "\"password\"");
+  if (start)
+  {
+    start+= strlen("\"password\":\"");
+    char *end=strchr(start, '\"');
+    if (end)
+    {
+      strncpy(pass, start,end-start);
+      pass[end - start] = '\0';
+      printf("\nPassword: %s\n", pass);
+    }
+  }
+
+  // find topic
+  start = strstr(data, "\"topic\"");
+  if (start)
+  {
+    start+= strlen("\"topic\":\"");
+    char *end=strchr(start, '\"');
+    if (end)
+    {
+      strncpy(topic, start,end-start);
+      topic[end - start] = '\0';
+      printf("\nTopic: %s\n", topic);
+    }
+  }
+
+  username.utf8 = user;
+  username.size = strlen(user);
+  password.utf8 = pass;
+  password.size = strlen(pass);
+  // strcpy(topic.utf8, topic);
+}
+
+static void response_cb(struct http_response *rsp,
+                        enum http_final_call final_data, void *user_data) {
+  if (final_data == HTTP_DATA_MORE) {
+    printf("Partial data received (%zd bytes)\n", rsp->data_len);
+  } else if (final_data == HTTP_DATA_FINAL) {
+    printf("All the data received (%zd bytes)\n", rsp->data_len);
+  }
+
+  printf("Response to %s\n", (const char *)user_data);
+  printf("Response status %s\n", rsp->http_status);
+  if (rsp->http_status_code == 200)
+  {
+    printf("MQTT Credentials obtained!\n");
+    printf("Data: %s\n", http_recv_buf);
+    parse_response(http_recv_buf, rsp->data_len);
+  }
+}
+
+static int connect_socket(const char *server, int port, int *sock,
+                          struct sockaddr *addr, socklen_t addr_len) {
+  int ret;
+
+  ret = setup_socket(server, port, sock, addr, addr_len);
+  if (ret < 0 || *sock < 0) {
+    return -1;
+  }
+
+  ret = connect(*sock, addr, addr_len);
+  if (ret < 0) {
+    printf("Cannot connect to IPv4 remote (%d)", -errno);
+    close(*sock);
+    *sock = -1;
+    ret = -errno;
+  }
+
+  return ret;
+}
+
+static int get_credentials(void) {
+  struct sockaddr_in addr;
+  int sock = -1;
+  int32_t timeout = 5000;
+  int ret = 0;
+  int port = HTTP_PORT;
+
+  connect_socket(SERVER_ADDR, port, &sock, (struct sockaddr *)&addr,
+                 sizeof(addr));
+
+  if (sock < 0) {
+    printf("Cannot create HTTP connection.");
+    return -ECONNABORTED;
+  }
+
+  struct http_request req;
+  const char *headers[] = {HEADERS, NULL};
+
+  memset(&req, 0, sizeof(req));
+
+  req.method = HTTP_POST;
+  req.url = ENDPOINT;
+  req.host = SERVER_ADDR;
+  req.protocol = "HTTP/1.1";
+  req.payload = REQ_PAYLOAD;
+  req.payload_len = strlen(req.payload);
+  req.response = response_cb;
+  req.recv_buf = http_recv_buf;
+  req.recv_buf_len = sizeof(http_recv_buf);
+  req.header_fields = headers;
+
+  ret = http_client_req(sock, &req, timeout, "IPv4 POST");
+
+  close(sock);
+  return ret;
+}
+// ---------------------------------------------
 static void prepare_fds(struct mqtt_client *client) {
   if (client->transport.type == MQTT_TRANSPORT_NON_SECURE) {
     fds[0].fd = client->transport.tcp.sock;
@@ -305,6 +462,13 @@ void setup() {
   // gpio
   gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
   gpio_pin_set_dt(&led, 0);
+
+  // http
+  k_sleep(K_MSEC(5000));
+  printf("Getting credentials ....\n");
+  get_credentials();
+
+  k_sleep(K_MSEC(5000));
 
   // mqtt
   while (!connected) {

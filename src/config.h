@@ -21,7 +21,4 @@
 
 #define MQTT_CLIENTID		"frdm_k64f_zephyr"
 
-#define MQTT_USERNAME		"user"
-#define MQTT_PASSWORD		"pass"
-
 #endif
