@@ -5,10 +5,12 @@
  */
 
 #include "config.h"
+#include "utils.h"
 
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -17,25 +19,14 @@
 #include <zephyr/kernel.h>
 #include <zephyr/net/http/client.h>
 #include <zephyr/net/mqtt.h>
+#include <zephyr/net/net_context.h>
+#include <zephyr/net/net_core.h>
+#include <zephyr/net/net_if.h>
+#include <zephyr/net/net_ip.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/random/random.h>
 
 static uint8_t http_recv_buf[MAX_RECV_BUF_LEN];
-
-#define RC_STR(rc) ((rc) == 0 ? "OK" : "ERROR")
-#define PRINT_RESULT(func, rc) printf("%s: %d <%s>\n", (func), rc, RC_STR(rc))
-#define SUCCESS_OR_EXIT(rc)                                                    \
-  {                                                                            \
-    if (rc != 0) {                                                             \
-      return 1;                                                                \
-    }                                                                          \
-  }
-#define SUCCESS_OR_BREAK(rc)                                                   \
-  {                                                                            \
-    if (rc != 0) {                                                             \
-      break;                                                                   \
-    }                                                                          \
-  }
 
 /* Buffers for MQTT client. */
 static uint8_t rx_buffer[APP_MQTT_BUFFER_SIZE];
@@ -56,121 +47,8 @@ static bool connected;
 #define LED0_NODE DT_ALIAS(led0)
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 
-#define MAX_VARIABLES 5
-#define MAX_STRING_LEN 100 // Maximum length for string fields
-
 /* DEVICE DATA */
-enum VarType { SENSOR, ACTUATOR };
-
-typedef struct {
-  char variable[MAX_STRING_LEN];
-  char variableFullName[MAX_STRING_LEN];
-  enum VarType variableType;
-  int variableSendFreq;
-} Variable;
-
-typedef struct {
-  char username[MAX_STRING_LEN];
-  char password[MAX_STRING_LEN];
-  char topic[MAX_STRING_LEN];
-  Variable variables[MAX_VARIABLES];
-  int variableCount;
-} DeviceData;
-
 static DeviceData device_data = {0};
-
-// Helper function to extract a string value
-void extractString(const char *json, const char *key, char *outValue) {
-
-  char *start = strstr(json, key);
-  if (start) {
-    start += strlen(key) + strlen(":\"");
-    char *end = strchr(start, '\"');
-    if (end) {
-      strncpy(outValue, start, end - start);
-      outValue[end - start] = '\0';
-    }
-  }
-}
-
-// Helper function to extract an integer value
-int extractInt(const char *json, const char *key) {
-  char *start = strstr(json, key);
-  if (start) {
-    start = strchr(start, ':') + 1;
-    return atoi(start);
-  }
-  return 0; // Default value if not found
-}
-
-// Function to parse the JSON string
-void parseJSON(const char *json, DeviceData *data) {
-  extractString(json, "\"username\"", data->username);
-  extractString(json, "\"password\"", data->password);
-  extractString(json, "\"topic\"", data->topic);
-
-  // Parse variables array
-  char *variablesStart = strstr(json, "\"variables\"");
-  if (variablesStart) {
-    variablesStart =
-        strchr(variablesStart, '[') + 1; // Move to the first array element
-    char *variablesEnd = strchr(variablesStart, ']');
-    char buffer[1024];
-    int varIndex = 0;
-
-    char type[100];
-    while (variablesStart < variablesEnd && varIndex < MAX_VARIABLES) {
-      char *variableEnd = strchr(variablesStart, '}') + 1;
-      strncpy(buffer, variablesStart, variableEnd - variablesStart);
-      buffer[variableEnd - variablesStart] = '\0';
-
-      // Parse fields in the variable
-      extractString(buffer, "\"variable\"", data->variables[varIndex].variable);
-      extractString(buffer, "\"variableFullName\"",
-                    data->variables[varIndex].variableFullName);
-      extractString(buffer, "\"variableType\"", type);
-
-      if (strcmp(type, "input") == 0) {
-        data->variables[varIndex].variableType = SENSOR;
-      } else {
-        data->variables[varIndex].variableType = ACTUATOR;
-      }
-
-      data->variables[varIndex].variableSendFreq =
-          extractInt(buffer, "\"variableSendFreq\"");
-
-      // Move to the next variable
-      variablesStart = variableEnd;
-      varIndex++;
-    }
-    data->variableCount = varIndex;
-  }
-}
-
-// Function to display the parsed data
-void printDeviceData(const DeviceData *data) {
-  printf("Username: %s\n", data->username);
-  printf("Password: %s\n", data->password);
-  printf("Topic: %s\n", data->topic);
-
-  for (int i = 0; i < data->variableCount; i++) {
-    printf("  Variable %d:\n", i + 1);
-    printf("    Variable: %s\n", data->variables[i].variable);
-    printf("    Variable Full Name: %s\n", data->variables[i].variableFullName);
-
-    if (data->variables[i].variableType == SENSOR)
-      printf("    Variable Type: SENSOR\n");
-    else
-      printf("    Variable Type: ACTUATOR\n");
-
-    if (data->variables[i].variableSendFreq > 0) {
-      printf("    Variable Send Freq: %d\n",
-             data->variables[i].variableSendFreq);
-    }
-  }
-}
-
-// ---------------------------------------------
 
 static int setup_socket(const char *server, int port, int *sock,
                         struct sockaddr *addr, socklen_t addr_len) {
@@ -191,17 +69,16 @@ static int setup_socket(const char *server, int port, int *sock,
 }
 
 void parse_response(char *data, size_t len) {
-  printf("Parsing....\n");
+  printf("Parsing...\n");
   parseJSON(data, &device_data);
   printDeviceData(&device_data);
+  device_data.isValid = true;
 }
 
 static void response_cb(struct http_response *rsp,
                         enum http_final_call final_data, void *user_data) {
   if (final_data == HTTP_DATA_MORE) {
     printf("Partial data received (%zd bytes)\n", rsp->data_len);
-  } else if (final_data == HTTP_DATA_FINAL) {
-    printf("All the data received (%zd bytes)\n", rsp->data_len);
   }
 
   printf("Response status %s\n", rsp->http_status);
@@ -222,7 +99,7 @@ static int connect_socket(const char *server, int port, int *sock,
 
   ret = connect(*sock, addr, addr_len);
   if (ret < 0) {
-    printf("Cannot connect to IPv4 remote (%d)", -errno);
+    printf("Cannot connect to IPv4 remote (%d)\n", -errno);
     close(*sock);
     *sock = -1;
     ret = -errno;
@@ -232,6 +109,7 @@ static int connect_socket(const char *server, int port, int *sock,
 }
 
 static int get_credentials(void) {
+  device_data.isValid = false;
   struct sockaddr_in addr;
   int sock = -1;
   int32_t timeout = 5000;
@@ -242,7 +120,7 @@ static int get_credentials(void) {
                  sizeof(addr));
 
   if (sock < 0) {
-    printf("Cannot create HTTP connection.");
+    printf("Cannot create HTTP connection.\n");
     return -ECONNABORTED;
   }
 
@@ -292,10 +170,40 @@ static int wait(int timeout) {
   return ret;
 }
 
+void process_actuators(void) {
+  if (strncmp(device_data.variables[1].lastValue, "false", 5) == 0) {
+    gpio_pin_set_dt(&led, 0);
+  } else {
+    gpio_pin_set_dt(&led, 1);
+  }
+}
+
 void process_message(struct mqtt_publish_message msg) {
   static uint8_t data[APP_MQTT_BUFFER_SIZE];
   mqtt_read_publish_payload(&client_ctx, data, msg.payload.len);
   printf("Received: %s from %s\n", data, msg.topic.topic.utf8);
+
+  // save data into device struct
+  // extract variable string
+  char *variable_start, *variable_end;
+  variable_start = strchr(msg.topic.topic.utf8, '/') + 1;
+  variable_start = strchr(variable_start, '/') + 1;
+  variable_end = strchr(variable_start, '/');
+  variable_start[variable_end - variable_start] = '\0';
+
+  for (int i = 0; i < device_data.variableCount; i++) {
+    if (device_data.variables[i].variableType == SENSOR)
+      continue;
+
+    if (strncmp(device_data.variables[i].variable, variable_start,
+                strlen(device_data.variables[i].variable)) == 0) {
+      char *value = strchr(data, ':') + 1;
+      strcpy(device_data.variables[i].lastValue, value);
+      break;
+    }
+  }
+
+  process_actuators();
 }
 
 void mqtt_evt_handler(struct mqtt_client *const client,
@@ -367,23 +275,6 @@ void mqtt_evt_handler(struct mqtt_client *const client,
   }
 }
 
-static char *get_mqtt_payload() {
-  static char payload[] = "{ \"value\": 1 }";
-  static int flag = 0;
-
-  if (flag) {
-    gpio_pin_set_dt(&led, 0);
-    payload[11] = '0';
-  } else {
-    gpio_pin_set_dt(&led, 1);
-    payload[11] = '1';
-  }
-
-  flag = (flag + 1) % 2;
-
-  return payload;
-}
-
 static int publish(struct mqtt_client *client, struct mqtt_topic topic,
                    struct mqtt_binstr payload) {
   struct mqtt_publish_param param;
@@ -439,34 +330,29 @@ static void client_init(struct mqtt_client *client) {
 
 /* In this routine we block until the connected variable is 1 */
 static int try_to_connect(struct mqtt_client *client) {
-  int rc, i = 0;
+  int rc;
 
-  while (i++ < APP_CONNECT_TRIES && !connected) {
+  client_init(client);
 
-    client_init(client);
+  rc = mqtt_connect(client);
 
-    rc = mqtt_connect(client);
-    if (rc != 0) {
-      PRINT_RESULT("mqtt_connect", rc);
-      k_sleep(K_MSEC(APP_SLEEP_MSECS));
-      continue;
-    }
+  if (rc != 0) {
+    PRINT_RESULT("mqtt_connect", rc);
+    k_sleep(K_MSEC(APP_SLEEP_MSECS));
+    return -1;
+  }
 
-    prepare_fds(client);
+  prepare_fds(client);
 
-    if (wait(APP_CONNECT_TIMEOUT_MS)) {
-      mqtt_input(client);
-    }
-
-    if (!connected) {
-      mqtt_abort(client);
-    }
+  if (wait(APP_SLEEP_MSECS)) {
+    mqtt_input(client);
   }
 
   if (connected) {
     return 0;
   }
 
+  mqtt_abort(client);
   return -EINVAL;
 }
 
@@ -524,40 +410,104 @@ void subscribe() {
   process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
 }
 
+static char *get_mqtt_payload(char *value, int save) {
+  static char payload_str[100] = "{\"value\":1,\"save\":0}";
+  payload_str[0] = '\0';
+  strcat(payload_str, "{\"value\":");
+  strcat(payload_str, value);
+
+  if (save)
+    strcat(payload_str, ",\"save\":1}");
+  else
+    strcat(payload_str, ",\"save\":0}");
+
+  return payload_str;
+}
+
+void send_data_to_broker(void) {
+  static int last_sent[MAX_VARIABLES] = {0};
+  static struct mqtt_topic topic;
+  static struct mqtt_binstr payload;
+
+  static char topic_str[100];
+
+  topic.qos = MQTT_QOS_0_AT_MOST_ONCE;
+  topic.topic.utf8 = topic_str;
+
+  int now = k_uptime_get();
+
+  for (int i = 0; i < device_data.variableCount; i++) {
+    if (device_data.variables[i].variableType == ACTUATOR)
+      continue;
+
+    int freq = device_data.variables[i].variableSendFreq * 1000;
+
+    // printf("Freq: %d | Now: %d | Last: %d\n", freq, now, last_sent[i]);
+    if (now - last_sent[i] < freq)
+      continue;
+
+    // topic is id/device_id/variable/sdata
+    topic_str[0] = '\0';
+    strcat(topic_str, device_data.topic);
+    strcat(topic_str, device_data.variables[i].variable);
+    strcat(topic_str, "/sdata");
+
+    topic.topic.size = strlen(topic.topic.utf8);
+
+    payload.data = get_mqtt_payload(device_data.variables[i].lastValue,
+                                    device_data.variables[i].save);
+    payload.len = strlen(payload.data);
+
+    publish(&client_ctx, topic, payload);
+    last_sent[i] = now;
+  }
+}
+
+void process_sensors(void) {
+  // get led status
+  int status = gpio_pin_get_dt(&led);
+  if (status)
+    strcpy(device_data.variables[0].lastValue, "1");
+  else
+    strcpy(device_data.variables[0].lastValue, "0");
+
+  // simulate temperature
+  int temp = rand() % 42;
+
+  sprintf(device_data.variables[3].lastValue, "%d", temp);
+  device_data.variables[3].save = 1;
+}
+
 void setup() {
   // gpio
   gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
   gpio_pin_set_dt(&led, 0);
 
-  // http
-  k_sleep(K_MSEC(5000));
-  printf("Getting credentials ....\n");
-  get_credentials();
-
-  k_sleep(K_MSEC(5000));
-
-  // mqtt
-  while (!connected) {
-    printf("attempting to connect: \n");
-    try_to_connect(&client_ctx);
-    k_sleep(K_MSEC(APP_SLEEP_MSECS));
-  }
-
-  k_sleep(K_MSEC(5000));
-  subscribe();
+  device_data.isValid = false;
 }
 
-static struct mqtt_topic topic;
-static struct mqtt_binstr payload;
+void loop(void) {
 
-void loop() {
-  topic.qos = MQTT_QOS_0_AT_MOST_ONCE;
-  topic.topic.utf8 = "679103d95d9261fdf4d81397/1/goRrYVqZw2/sdata";
-  topic.topic.size = strlen(topic.topic.utf8);
-  payload.data = get_mqtt_payload();
-  payload.len = strlen(payload.data);
+  // http
+  if (!device_data.isValid) {
+    printf("Getting credentials ...\n");
+    get_credentials();
+    k_sleep(K_MSEC(APP_SLEEP_MSECS));
+    return;
+  }
 
-  publish(&client_ctx, topic, payload);
+  // mqtt
+  if (!connected) {
+    printf("Connecting to MQTT broker\n");
+    try_to_connect(&client_ctx);
+    k_sleep(K_MSEC(APP_SLEEP_MSECS));
+    subscribe();
+    return;
+  }
+
+  // PROGRAM
+  process_sensors();
+  send_data_to_broker();
   process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
 }
 
