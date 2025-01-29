@@ -50,6 +50,156 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 /* DEVICE DATA */
 static DeviceData device_data = {0};
 
+/* Function Definitions */
+static void setup(void);
+static void loop(void);
+static void process_actuators(void);
+static void process_sensors(void);
+static int get_credentials();
+static int try_to_connect(struct mqtt_client *client);
+static void subscribe(void);
+static void send_data_to_broker(void);
+static int process_mqtt_and_sleep(struct mqtt_client *client, int timeout);
+static int publish(struct mqtt_client *client, struct mqtt_topic topic,
+                   struct mqtt_binstr payload);
+static char *get_mqtt_payload(char *value, int save);
+
+// ------------------------ MAIN, SETUP AND LOOP LOGIC -----------------
+
+int main(void) {
+  setup();
+  while (1) {
+    loop();
+  }
+}
+
+static void setup(void) {
+  // gpio
+  gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
+  gpio_pin_set_dt(&led, 0);
+
+  device_data.isValid = false;
+}
+
+static void loop(void) {
+
+  // http
+  if (!device_data.isValid) {
+    printf("Getting credentials ...\n");
+    get_credentials();
+    k_sleep(K_MSEC(APP_SLEEP_MSECS));
+    return;
+  }
+
+  // mqtt
+  if (!connected) {
+    printf("Connecting to MQTT broker\n");
+    try_to_connect(&client_ctx);
+    k_sleep(K_MSEC(APP_SLEEP_MSECS));
+    subscribe();
+    return;
+  }
+
+  // PROGRAM
+  process_sensors();
+  send_data_to_broker();
+  process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
+}
+
+// ------------------------ CUSTOM LOGIC --------------------------------
+
+void process_actuators(void) {
+  if (strncmp(device_data.variables[1].lastValue, "false", 5) == 0) {
+    gpio_pin_set_dt(&led, 0);
+  } else {
+    gpio_pin_set_dt(&led, 1);
+  }
+}
+
+void process_message(struct mqtt_publish_message msg) {
+  static uint8_t data[APP_MQTT_BUFFER_SIZE];
+  mqtt_read_publish_payload(&client_ctx, data, msg.payload.len);
+  printf("Received: %s from %s\n", data, msg.topic.topic.utf8);
+
+  // save data into device struct
+  // extract variable string
+  char *variable_start, *variable_end;
+  variable_start = strchr(msg.topic.topic.utf8, '/') + 1;
+  variable_start = strchr(variable_start, '/') + 1;
+  variable_end = strchr(variable_start, '/');
+  variable_start[variable_end - variable_start] = '\0';
+
+  for (int i = 0; i < device_data.variableCount; i++) {
+    if (device_data.variables[i].variableType == SENSOR)
+      continue;
+
+    if (strncmp(device_data.variables[i].variable, variable_start,
+                strlen(device_data.variables[i].variable)) == 0) {
+      char *value = strchr(data, ':') + 1;
+      strcpy(device_data.variables[i].lastValue, value);
+      break;
+    }
+  }
+
+  process_actuators();
+}
+
+static void send_data_to_broker(void) {
+  static int last_sent[MAX_VARIABLES] = {0};
+  static struct mqtt_topic topic;
+  static struct mqtt_binstr payload;
+
+  static char topic_str[100];
+
+  topic.qos = MQTT_QOS_0_AT_MOST_ONCE;
+  topic.topic.utf8 = topic_str;
+
+  int now = k_uptime_get();
+
+  for (int i = 0; i < device_data.variableCount; i++) {
+    if (device_data.variables[i].variableType == ACTUATOR)
+      continue;
+
+    int freq = device_data.variables[i].variableSendFreq * 1000;
+
+    // printf("Freq: %d | Now: %d | Last: %d\n", freq, now, last_sent[i]);
+    if (now - last_sent[i] < freq)
+      continue;
+
+    // topic is id/device_id/variable/sdata
+    topic_str[0] = '\0';
+    strcat(topic_str, device_data.topic);
+    strcat(topic_str, device_data.variables[i].variable);
+    strcat(topic_str, "/sdata");
+
+    topic.topic.size = strlen(topic.topic.utf8);
+
+    payload.data = get_mqtt_payload(device_data.variables[i].lastValue,
+                                    device_data.variables[i].save);
+    payload.len = strlen(payload.data);
+
+    publish(&client_ctx, topic, payload);
+    last_sent[i] = now;
+  }
+}
+
+void process_sensors(void) {
+  // get led status
+  int status = gpio_pin_get_dt(&led);
+  if (status)
+    strcpy(device_data.variables[0].lastValue, "1");
+  else
+    strcpy(device_data.variables[0].lastValue, "0");
+
+  // simulate temperature
+  int temp = rand() % 42;
+
+  sprintf(device_data.variables[3].lastValue, "%d", temp);
+  device_data.variables[3].save = 1;
+}
+
+// ------------------------ HTTP and MQTT ---------------------------------
+
 static int setup_socket(const char *server, int port, int *sock,
                         struct sockaddr *addr, socklen_t addr_len) {
   int ret = 0;
@@ -168,42 +318,6 @@ static int wait(int timeout) {
   }
 
   return ret;
-}
-
-void process_actuators(void) {
-  if (strncmp(device_data.variables[1].lastValue, "false", 5) == 0) {
-    gpio_pin_set_dt(&led, 0);
-  } else {
-    gpio_pin_set_dt(&led, 1);
-  }
-}
-
-void process_message(struct mqtt_publish_message msg) {
-  static uint8_t data[APP_MQTT_BUFFER_SIZE];
-  mqtt_read_publish_payload(&client_ctx, data, msg.payload.len);
-  printf("Received: %s from %s\n", data, msg.topic.topic.utf8);
-
-  // save data into device struct
-  // extract variable string
-  char *variable_start, *variable_end;
-  variable_start = strchr(msg.topic.topic.utf8, '/') + 1;
-  variable_start = strchr(variable_start, '/') + 1;
-  variable_end = strchr(variable_start, '/');
-  variable_start[variable_end - variable_start] = '\0';
-
-  for (int i = 0; i < device_data.variableCount; i++) {
-    if (device_data.variables[i].variableType == SENSOR)
-      continue;
-
-    if (strncmp(device_data.variables[i].variable, variable_start,
-                strlen(device_data.variables[i].variable)) == 0) {
-      char *value = strchr(data, ':') + 1;
-      strcpy(device_data.variables[i].lastValue, value);
-      break;
-    }
-  }
-
-  process_actuators();
 }
 
 void mqtt_evt_handler(struct mqtt_client *const client,
@@ -388,7 +502,7 @@ static int process_mqtt_and_sleep(struct mqtt_client *client, int timeout) {
   return 0;
 }
 
-void subscribe() {
+static void subscribe(void) {
   struct mqtt_subscription_list list;
   struct mqtt_topic topics[1];
   const int ntopics = 1;
@@ -422,98 +536,4 @@ static char *get_mqtt_payload(char *value, int save) {
     strcat(payload_str, ",\"save\":0}");
 
   return payload_str;
-}
-
-void send_data_to_broker(void) {
-  static int last_sent[MAX_VARIABLES] = {0};
-  static struct mqtt_topic topic;
-  static struct mqtt_binstr payload;
-
-  static char topic_str[100];
-
-  topic.qos = MQTT_QOS_0_AT_MOST_ONCE;
-  topic.topic.utf8 = topic_str;
-
-  int now = k_uptime_get();
-
-  for (int i = 0; i < device_data.variableCount; i++) {
-    if (device_data.variables[i].variableType == ACTUATOR)
-      continue;
-
-    int freq = device_data.variables[i].variableSendFreq * 1000;
-
-    // printf("Freq: %d | Now: %d | Last: %d\n", freq, now, last_sent[i]);
-    if (now - last_sent[i] < freq)
-      continue;
-
-    // topic is id/device_id/variable/sdata
-    topic_str[0] = '\0';
-    strcat(topic_str, device_data.topic);
-    strcat(topic_str, device_data.variables[i].variable);
-    strcat(topic_str, "/sdata");
-
-    topic.topic.size = strlen(topic.topic.utf8);
-
-    payload.data = get_mqtt_payload(device_data.variables[i].lastValue,
-                                    device_data.variables[i].save);
-    payload.len = strlen(payload.data);
-
-    publish(&client_ctx, topic, payload);
-    last_sent[i] = now;
-  }
-}
-
-void process_sensors(void) {
-  // get led status
-  int status = gpio_pin_get_dt(&led);
-  if (status)
-    strcpy(device_data.variables[0].lastValue, "1");
-  else
-    strcpy(device_data.variables[0].lastValue, "0");
-
-  // simulate temperature
-  int temp = rand() % 42;
-
-  sprintf(device_data.variables[3].lastValue, "%d", temp);
-  device_data.variables[3].save = 1;
-}
-
-void setup() {
-  // gpio
-  gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
-  gpio_pin_set_dt(&led, 0);
-
-  device_data.isValid = false;
-}
-
-void loop(void) {
-
-  // http
-  if (!device_data.isValid) {
-    printf("Getting credentials ...\n");
-    get_credentials();
-    k_sleep(K_MSEC(APP_SLEEP_MSECS));
-    return;
-  }
-
-  // mqtt
-  if (!connected) {
-    printf("Connecting to MQTT broker\n");
-    try_to_connect(&client_ctx);
-    k_sleep(K_MSEC(APP_SLEEP_MSECS));
-    subscribe();
-    return;
-  }
-
-  // PROGRAM
-  process_sensors();
-  send_data_to_broker();
-  process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
-}
-
-int main(void) {
-  setup();
-  while (1) {
-    loop();
-  }
 }
